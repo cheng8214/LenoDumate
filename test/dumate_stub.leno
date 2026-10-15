@@ -1,0 +1,155 @@
+// test/dumate_stub.leno — DuMate 接口本地 stub（够用的 HTTP/1.1，只伺候回归测试）
+//
+// 为什么要有它：签到"未签→领取"这条路径**一天只能碰一次真接口**，而
+// "服务端判已签 / 领取被拒 / 登录过期 / 积分永久哨兵"这些分支平时根本撞不上，
+// 偏偏它们最容易写错 ⇒ 用本地 stub 把整条链路端到端跑一遍。
+//
+// 用法：leno test\dumate_stub.leno [port]
+//      环境变量 DUMATE_STUB_MODE 选场景（见 route 的 mode 分支）
+//
+// ⚠ 它**只**监听 127.0.0.1、只回预设 JSON，不含任何真实凭据逻辑。
+import sockets
+import strings
+import jsons
+import times
+
+struct Stub {
+    bool signed = false
+    int claims = 0
+    int requests = 0
+    string mode = "fresh"
+}
+
+// 从连接上读完整的一个请求（头 + 按 Content-Length 读满 body）
+func read_request(Socket conn, Dict[string, any] info): string {
+    var head = ""
+    while true {
+        var chunk = conn.recv(4096)
+        if chunk == null { return "" }
+        head = head + chunk
+        if head.byte_find("\r\n\r\n") >= 0 { break }
+        if head.byte_len() > 65536 { return head }
+    }
+    var split = head.byte_find("\r\n\r\n")
+    var body_have = head.byte_slice(split + 4, head.byte_len() - 1)
+    var want = 0
+    for head.lines() to line {
+        var low = line.to_lower()
+        if strings.starts_with(low, "content-length:") {
+            want = _int(low.slice(15, low.len() - 1).trim())
+        }
+    }
+    while body_have.byte_len() < want {
+        var more = conn.recv(4096)
+        if more == null { break }
+        body_have = body_have + more
+    }
+    info.set("body", body_have)
+    var first = head.lines()[0]
+    var parts = first.split(" ")
+    if parts.len() >= 2 {
+        info.set("method", parts[0])
+        // 剥掉查询串再路由：quota_overview 带 ?timezone=...&clientType=...（真实客户端就这么调的）
+        var p = parts[1]
+        var q = p.byte_find("?")
+        if q >= 0 { p = p.byte_slice(0, q - 1) }
+        info.set("path", p)
+    }
+    return head
+}
+
+func respond(Socket conn, int code, string body) {
+    var reason = "OK"
+    if code == 400 { reason = "Bad Request" }
+    if code == 401 { reason = "Unauthorized" }
+    if code == 404 { reason = "Not Found" }
+    if code == 500 { reason = "Internal Server Error" }
+    var text = "HTTP/1.1 " + _str(code) + " " + reason + "\r\n"
+        + "Content-Type: application/json\r\n"
+        + "Content-Length: " + _str(body.byte_len()) + "\r\n"
+        + "Connection: close\r\n\r\n" + body
+    conn.send(text)
+    conn.close()
+}
+
+// loginBonusInfo 的响应体（形状对齐真实接口：result.signInDays / totalPoints）
+func info_body(Stub s): string {
+    var today = times.format(times.now(), "%Y-%m-%d")
+    if s.signed {
+        return "{\"logId\":\"stub\",\"code\":0,\"message\":\"\",\"success\":true,"
+            + "\"result\":{\"totalTimes\":1,\"totalPoints\":500,\"hasIssued\":true,"
+            + "\"signInDays\":[\"" + today + "\"]}}"
+    }
+    return "{\"logId\":\"stub\",\"code\":0,\"message\":\"\",\"success\":true,"
+        + "\"result\":{\"totalTimes\":0,\"totalPoints\":0,\"hasIssued\":false,"
+        + "\"signInDays\":[]}}"
+}
+
+// 返回 [http_code, body]
+func route(Stub s, string method, string path): Array[string] {
+    // ---- 场景开关 ----
+    if s.mode == "no_auth" {
+        return ["200", "{\"logId\":\"stub\",\"code\":401,\"message\":\"未登录或登录已过期\","
+                + "\"success\":false,\"result\":{}}"]
+    }
+    if path == "/api/dumate/points/loginBonusInfo" {
+        if s.mode == "already" { s.signed = true }
+        return ["200", info_body(s)]
+    }
+    if path == "/api/dumate/points/loginBonus" {
+        if s.mode == "claim_fail" {
+            return ["200", "{\"logId\":\"stub\",\"code\":5001,\"message\":\"领取失败：今日名额已满\","
+                    + "\"success\":false,\"result\":{}}"]
+        }
+        s.signed = true
+        s.claims = s.claims + 1
+        return ["200", "{\"logId\":\"stub\",\"code\":0,\"message\":\"success\",\"success\":true,"
+                + "\"result\":{\"success\":true}}"]
+    }
+    if path == "/api/dumate/points/quota_overview" {
+        // 含"永久有效"哨兵（expireDate=253370764800，约公元 9998 年）与一个 2099 年的
+        return ["200", "{\"logId\":\"stub\",\"code\":0,\"message\":\"\",\"success\":true,"
+                + "\"result\":{\"isSubscribed\":false,\"usedPoints\":\"0\",\"totalPoints\":\"0\","
+                + "\"subscription\":[],\"incremental\":["
+                + "{\"packageId\":\"p1\",\"usedPoints\":\"500.00\",\"totalPoints\":\"500.00\","
+                + "\"expireDate\":1794585599,\"packageType\":\"grant_point\","
+                + "\"source\":\"login_bonus\",\"status\":\"used\",\"product\":\"dumate\"},"
+                + "{\"packageId\":\"p2\",\"usedPoints\":\"20.00\",\"totalPoints\":\"20.00\","
+                + "\"expireDate\":1794658103,\"packageType\":\"event_bonus\","
+                + "\"source\":\"growth_plan_2026_bonus\",\"status\":\"used\",\"product\":\"dumate\"},"
+                + "{\"packageId\":\"p3\",\"usedPoints\":\"0\",\"totalPoints\":\"5000.00\","
+                + "\"expireDate\":4102415940,\"packageType\":\"grant_point\","
+                + "\"source\":\"event_bonus\",\"status\":\"active\",\"product\":\"dumate\"},"
+                + "{\"packageId\":\"p4\",\"usedPoints\":\"0\",\"totalPoints\":\"2000.00\","
+                + "\"expireDate\":253370764800,\"packageType\":\"grant_point\","
+                + "\"source\":\"invite_bonus\",\"status\":\"used\",\"product\":\"dumate\"}"
+                + "]}}"]
+    }
+    return ["404", "{\"code\":404,\"message\":\"no route: " + path + "\",\"success\":false}"]
+}
+
+main() {
+    var args = _args()
+    var port = 8931
+    if args.len() > 0 { port = _int(args[0]) }
+    var max_requests = _int(_env_or("DUMATE_STUB_MAX", "200"))
+    var s = new Stub(mode = _env_or("DUMATE_STUB_MODE", "fresh"))
+    var srv = sockets.listen("127.0.0.1", port)
+    if srv == null {
+        print("STUB_LISTEN_FAILED " + _str(port))
+        _exit(1)
+    }
+    print("STUB_READY " + _str(port) + " mode=" + s.mode)
+    while s.requests < max_requests {
+        var conn = srv.accept()
+        if conn == null { break }
+        var info = {}
+        read_request(conn, info)
+        s.requests = s.requests + 1
+        var method = jsons.get_str(info, "method", "")
+        var path = jsons.get_str(info, "path", "")
+        var result = route(s, method, path)
+        respond(conn, _int(result[0]), result[1])
+    }
+    srv.close()
+}

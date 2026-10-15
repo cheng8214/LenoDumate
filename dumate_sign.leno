@@ -1,0 +1,127 @@
+// dumate_sign.leno — 百度搭子 DuMate 每日签到（Leno 版 · CLI）
+//
+// 逻辑与核心都在 dumate_core.leno，本文件只做"参数解析 + 输出格式"（CLI 与 GUI 共用同一核心 ✓）
+//
+// 用法（位置子命令；单/双横线别名同样可用）：
+//   leno dumate_sign.leno              # 签到（默认；今天已签到会提示无需重复）
+//   leno dumate_sign.leno status       # 只查状态，不签到（= -s = --status）
+//   leno dumate_sign.leno health       # 登录态健康检查（剩余天数）
+//   leno dumate_sign.leno credits      # 积分套餐与到期时间
+//   leno dumate_sign.leno diag         # 诊断：账号/cookie 数/请求头长度（不打印 cookie 值）
+//   leno dumate_sign.leno json         # 结果用一行 JSON 输出（便于脚本调用）
+//
+// 安全：只**读**登录态文件；**不打印 token/cookie 值**；不修改登录态文件 ✓
+import jsons
+import "dumate_core.leno" as core
+
+var JSON_MODE = false
+
+// JSON 模式下诊断信息不上 stdout（保持 stdout 只有一行 JSON）✓
+func say(string s) {
+    if not JSON_MODE { print(s) }
+}
+
+func emit_json(Dict[string, any] r) {
+    print(jsons.encode(r))
+}
+
+func fail(string msg) {
+    if JSON_MODE {
+        print(jsons.encode({"platform": core.PLATFORM_NAME, "success": false,
+                            "status": "failed", "message": msg, "credits": 0}))
+    } else {
+        print("ERROR: " + msg)
+    }
+    _exit(1)
+}
+
+main() {
+    var args = _args()
+    var mode = "sign"
+    int i = 0
+    while i < args.len() {
+        var a = args[i]
+        if a == "status" or a == "-s" or a == "--status" { mode = "status" }
+        else if a == "health" or a == "-h" or a == "--health" { mode = "health" }
+        else if a == "credits" or a == "-c" or a == "--credits" { mode = "credits" }
+        else if a == "diag" or a == "-d" or a == "--diag" { mode = "diag" }
+        else if a == "json" or a == "-j" or a == "--json" { JSON_MODE = true }
+        else if a == "sign" or a == "--sign" { mode = "sign" }
+        i = i + 1
+    }
+
+    try {
+        // ---- health：登录态健康检查 ----
+        if mode == "health" {
+            var h = core.health()
+            if JSON_MODE { emit_json(h); return }
+            var icon = "✅"
+            var st = jsons.get_str(h, "status", "")
+            if st == "warn" { icon = "⚠️" }
+            if st == "expired" { icon = "🚨" }
+            if st == "unknown" { icon = "❓" }
+            print(icon + " " + jsons.get_str(h, "platform", "") + "：" + jsons.get_str(h, "message", ""))
+            return
+        }
+
+        // ---- credits：积分套餐与到期 ----
+        if mode == "credits" {
+            var items = core.credits()
+            if JSON_MODE {
+                print(jsons.encode({"platform": core.PLATFORM_NAME, "items": items}))
+                return
+            }
+            if items.len() == 0 {
+                print("暂无积分到期信息")
+                return
+            }
+            for items to it {
+                var dl = jsons.get_int(it, "days_left", 999)
+                var icon = "🔸"
+                if dl <= 7 { icon = "🚨" }
+                else if dl <= 30 { icon = "⚠️" }
+                var creditsText = jsons.get_str(it, "credits", "0")
+                print(icon + " " + core.PLATFORM_NAME + "·" + jsons.get_str(it, "label", "")
+                      + "：" + creditsText + " 分 到期 " + jsons.get_str(it, "expires_at", "")
+                      + "（剩 " + _str(dl) + " 天）")
+            }
+            return
+        }
+
+        // ---- diag：诊断（只打印可公开的元信息，不打印 cookie 值）----
+        if mode == "diag" {
+            var d = core.diag()
+            if JSON_MODE { emit_json(d); return }
+            print("[leno] 平台=" + jsons.get_str(d, "platform", "")
+                  + " 账号=" + jsons.get_str(d, "account", "")
+                  + " 数据目录=" + jsons.get_str(d, "app_dir", "")
+                  + " cookie数=" + _str(jsons.get_int(d, "cookie_count", 0))
+                  + " Cookie头长度=" + _str(jsons.get_int(d, "cookie_header_len", 0))
+                  + " csrftoken长度=" + _str(jsons.get_int(d, "csrf_len", 0)))
+            return
+        }
+
+        // ---- sign / status：签到或只查状态 ----
+        var r = core.checkin(mode == "status")
+        if JSON_MODE { emit_json(r); return }
+        var st = jsons.get_str(r, "status", "")
+        var msg = jsons.get_str(r, "message", "")
+        if st == "success" {
+            print("🎉 " + msg)
+            return
+        }
+        if st == "already" {
+            print("✅ " + msg)
+            return
+        }
+        if st == "skipped" {
+            print("👀 " + msg)
+            return
+        }
+        print("❌ " + msg)
+        _exit(1)
+    } catch e {
+        var code = _str(e.msg)
+        fail(core.reason_text(code))
+    }
+}

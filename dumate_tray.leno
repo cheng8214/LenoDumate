@@ -1,0 +1,206 @@
+// dumate_tray.leno — 系统托盘 + 自绘菜单 + 开机自启动（系统集成层）
+//
+// 单独一个文件：托盘/菜单/自启动与界面无关（dumate_gui.leno 只管画界面）⇒ 换界面不影响这一层。
+// 参照 LenoWorkBuddy 的 wb_tray.leno / LenoTrae 的 trae_tray.leno（同一套约定 ✓）
+//
+// ⚠ 关键前提（来自 LenoSDL3 的 sdl_tray.leno）：
+//   用 interceptTrayClick() 拦点击时**绝不能**调 tray.getMenu() —— 只要 tray 有菜单，
+//   SDL 会在托盘窗口的 WndProc 里开自己的**模态**菜单（TrackPopupMenu 按住主循环 ⇒ 画面冻结）。
+//   所以这里：托盘只做图标 + 悬停提示，菜单用**自绘**的 PopMenu（非模态 ⇒ 菜单开着界面照常 ✓）。
+//
+// 交互：右键托盘图标 = 弹菜单；左键 = 直接显示/隐藏窗口（与 WorkBuddy / Trae / 模拟时钟同一套 ✓）
+// 开机自启动：走 LenoSys 的 set/get/removeAutostart（Windows = Run 键 / Linux = autostart 目录 ✓），
+//   写入的命令行带 `--tray` ⇒ 开机自启时**启动即只留托盘**（不打扰用户 ✓）
+import SDL3
+import Sys
+import dirs
+use SDL3.(Tray, PopMenu, Window)
+
+const VAL_NAME = "LenoDumate"
+const ENTRY = "dumate_gui.leno"          // 未打包时自启命令行里的入口脚本名
+
+// 托盘层需要的回调（由 dumate_gui 注入；放这里 ⇒ 托盘层不认识业务模块）
+func():void _onSignin = null
+func():void _onStatus = null
+string _valName = VAL_NAME
+
+Window?  _win  = null
+PopMenu? _pm   = null
+Tray?    _tray = null
+bool     _hasTray = false
+bool     _hasMenu = false
+bool     _inited  = false
+bool     _visible = true
+// 托盘图标 surface **留到退出再释放**：SDL 是否复制它没能证实（照 LenoSDL3 的原话）⇒
+//   提前 destroySurface 有可能是野指针，平时不显形、唤醒/Explorer 重启时才崩
+Ptr[u8]  _iconSurf = null
+string   _imgDir = ""
+string   _tip = "百度搭子 DuMate 签到"
+
+// 动作标记：回调只置位，主循环 tick 里统一落地（避免在菜单回调里做事）
+bool _actToggle = false
+bool _actSignin = false
+bool _actStatus = false
+bool _actAuto   = false
+bool _actQuit   = false
+
+func _ip(string n): string { return dirs.join(_imgDir, n) }
+
+// ==================== 开机自启动 ====================
+export func autostart_on(): bool {
+    try { return Sys.getAutostart(VAL_NAME) != "" } catch e { return false }
+}
+
+// 自启命令行：打包态只写 exe；未打包 = exe + 入口脚本（都带 --tray）
+func launch_cmd(): string {
+    var exe = ""
+    try { exe = Sys.exePath() } catch e { exe = "" }
+    if exe == "" { return "" }
+    if dirs.res_dir() != dirs.script_dir() { return "\"" + exe + "\" --tray" }
+    return "\"" + exe + "\" \"" + dirs.join(dirs.script_dir(), ENTRY) + "\" --tray"
+}
+
+export func set_autostart(bool on): bool {
+    try {
+        if on {
+            var cmd = launch_cmd()
+            if cmd == "" { return false }
+            return Sys.setAutostart(VAL_NAME, "百度搭子 DuMate 签到", cmd)
+        }
+        return Sys.removeAutostart(VAL_NAME)
+    } catch e {
+        return false
+    }
+}
+
+// ==================== 初始化 / 每拍 / 收尾 ====================
+// on_signin：点菜单/托盘「立即签到」时调；on_status：点「查状态」时调（都传 GUI 自己的动作 ✓）
+export func tray_init(Window win, func():void on_signin, func():void on_status): bool {
+    _win = win
+    _onSignin = on_signin
+    _onStatus = on_status
+    _imgDir = dirs.join(dirs.res_dir(), "images")
+
+    // 托盘图标 = images/dumate.png（生成脚本见 tools/gen_dumate_icon.leno；
+    // 打包态由 resource.toml 的 resources = ["images/**"] 一起内嵌到解包目录 ✓）
+    Ptr[u8] surf = SDL3.loadImage(_ip("dumate.png"))
+    if surf == null { print("[tray] 图标加载失败：" + _ip("dumate.png") + "\n") }
+    _iconSurf = surf
+    // createTray 失败时返回 null；静态返回类型不可空 ⇒ 用 `Tray?` 接，避免假告警
+    Tray? t = SDL3.createTray({icon: surf, tooltip: _tip})
+    if t == null {
+        print("[tray] 托盘创建失败 ⇒ 退化为无托盘模式（关窗即退出）\n")
+        return false
+    }
+    _tray = t
+    _hasTray = true
+    // 拦下「托盘图标被点」（Windows 子类化 SDL_TRAY 窗口 ✓）；失败 ⇒ 只剩图标与提示 ✓
+    if not SDL3.interceptTrayClick() { print("[tray] 托盘点击拦截不可用（非 Windows?）⇒ 菜单不可达，请用窗口内按钮\n") }
+
+    // 自绘菜单（非模态 ⇒ 菜单开着时界面照常 ✓）；菜单图标传 "" ⇒ 无图标（不依赖额外资源 ✓）
+    PopMenu? pm = SDL3.createPopMenu({font_size: 14.0})
+    if pm == null or not pm.ok() {
+        print("[tray] 自绘菜单创建失败\n")
+        return false
+    }
+    _pm = pm
+    _hasMenu = true
+    pm.addItem("隐藏窗口", "", func() { _actToggle = true })               // 0
+    pm.addItem("立即签到", "", func() { _actSignin = true })               // 1
+    pm.addItem("查状态", "", func() { _actStatus = true })                 // 2
+    pm.addSeparator()                                                     // 3
+    pm.addCheck("开机自启动", "", autostart_on(), func() { _actAuto = true })  // 4
+    pm.addSeparator()                                                     // 5
+    pm.addItem("退出", "", func() { _actQuit = true })                    // 6
+    _inited = true
+    print("[tray] 就绪：右键=菜单，左键=显示/隐藏窗口"
+          + (if autostart_on() then "（开机自启动已开）" else "") + "\n")
+    return true
+}
+
+export func tray_show(bool v) {
+    _visible = v
+    if v {
+        var w = _win
+        if w != null { w.show(); w.raise() }
+    } else {
+        var w2 = _win
+        if w2 != null { w2.hide() }
+        var m = _pm
+        if m != null { m.hide() }
+    }
+}
+
+export func tray_visible(): bool { return _visible }
+
+export func tray_set_tip(string t) {
+    _tip = "百度搭子 DuMate 签到 · " + t
+    var tr = _tray
+    if tr != null { tr.setTooltip(_tip) }
+}
+
+func open_menu(int x, int y) {
+    var m = _pm
+    if m == null { return }
+    m.setText(0, if _visible then "隐藏窗口" else "显示窗口")
+    m.setChecked(4, autostart_on())
+    m.showAt(x, y)
+}
+
+export func tray_tick() {
+    if not _inited { return }
+    var tp = SDL3.pollTrayClick()
+    if tp.len() >= 3 {
+        if _int(tp[2]) == 2 { open_menu(_int(tp[0]), _int(tp[1])) }   // 右键 ⇒ 菜单
+        else { _actToggle = true }                                    // 左键 ⇒ 切显隐
+    }
+    var m = _pm
+    if m != null { m.poll() }                                          // 点菜单外 ⇒ 自动收起
+
+    if _actToggle {
+        _actToggle = false
+        tray_show(not _visible)
+    }
+    if _actSignin {
+        _actSignin = false
+        var cb = _onSignin
+        if cb != null { cb() }
+    }
+    if _actStatus {
+        _actStatus = false
+        var cb = _onStatus
+        if cb != null { cb() }
+    }
+    if _actAuto {
+        _actAuto = false
+        var want = not autostart_on()
+        var ok = set_autostart(want)
+        if ok {
+            print("[tray] 开机自启动已" + (if want then "开启" else "关闭") + "\n")
+        } else {
+            print("[tray] 开机自启动设置失败（" + os_name() + "：自启项不可写或本平台未实现）\n")
+        }
+    }
+    if _actQuit {
+        _actQuit = false
+        SDL3.requestExit()
+    }
+}
+
+export func tray_shutdown() {
+    var tr = _tray
+    if tr != null { tr.destroy() }          // 内部先恢复原 WndProc，再销毁托盘（顺序不能反）
+    var m = _pm
+    if m != null { m.destroy() }
+    if _iconSurf != null {
+        SDL3.destroySurface(_iconSurf)
+        _iconSurf = null
+    }
+    _hasTray = false
+    _hasMenu = false
+    _inited = false
+}
+
+func os_name(): string {
+    try { return Sys.os() } catch e { return "?" }
+}

@@ -1,0 +1,511 @@
+// dumate_core.leno — 百度搭子 DuMate（千帆桌面客户端）每日签到核心（CLI 与 GUI 共用）
+//
+// 登录态文件（Windows）：
+//   %APPDATA%\qianfan-desktop-app\auth.json      （accountProfiles[].encryptedCookies，base64）
+//   %APPDATA%\qianfan-desktop-app\.cookie-key    （32 字节 AES-256 密钥，原始随机数）
+//   密文布局：base64 解码后 = iv(12) + authTag(16) + ciphertext
+//
+// 安全：只**读**登录态文件；**不打印 token/cookie 值**；不修改登录态文件 ✓
+//
+// 约定：本文件**不打印任何东西**、不含 `main()`、不解析命令行参数 ⇒ 可安全被多方 import ✓
+import jsons
+import strings
+import files
+import dirs
+import times
+import "web_net" as net
+use net.(HttpClient, Response)
+import "Crypto" as crypto
+
+// ==================== 常量 ====================
+export var PLATFORM_NAME = "百度搭子 DuMate"
+export var DAILY_CREDITS = 500
+export var API_BASE = "https://console.bce.baidu.com"
+export var INFO_PATH = "/api/dumate/points/loginBonusInfo"
+export var BONUS_PATH = "/api/dumate/points/loginBonus"
+export var QUOTA_PATH = "/api/dumate/points/quota_overview"
+export var TARGET_HOST = "console.bce.baidu.com"
+export var REQUEST_TIMEOUT = 30
+
+// ==================== 会话 ====================
+// 不叫 Session：web_net 里已有一个同名的 HTTP Session struct。Leno 现在对跨模块
+// struct 同名做**编译期**拦截（异形直接编不过、同形给警告），所以这里错名只是避开
+// 那条冲突告警，不再有"运行期静默读错字段"的风险 ✓
+export struct DuSession {
+    Array[any] cookies = []      // 解密出的全部 cookies（Array[Dict[string, any]]）
+    string cookieHeader = ""     // 按 TARGET_HOST 匹配出来的 Cookie 请求头
+    string csrf = ""             // bce-user-info cookie 值（csrftoken 请求头）
+    string displayName = ""      // 激活账号显示名（不打印 token）
+}
+
+// 一次 API 调用的结果。code == 0 ⇒ libcurl 层就没拿到响应（连不上/超时）
+export struct ApiResp {
+    int code = 0
+    Dict[string, any] body = {}
+}
+
+// ==================== 登录态定位 ====================
+// 数据目录：%APPDATA%\qianfan-desktop-app（可用 DUMATE_APP_DIR 覆盖，便于测试）
+export func app_dir(): string {
+    var override = _env_or("DUMATE_APP_DIR", "")
+    if override != "" { return override }
+    var appdata = _env_or("APPDATA", "")
+    if appdata == "" {
+        var home = _env_or("USERPROFILE", "")
+        appdata = dirs.join(dirs.join(home, "AppData"), "Roaming")
+    }
+    return dirs.join(appdata, "qianfan-desktop-app")
+}
+
+// ==================== 小工具 ====================
+// 取子数组 [from, to]（双闭）。不直接用 arr[a:b]：切片端点语义与字符串 slice 不一致，易错
+func sub(Array[int] a, int from, int endIdx): Array[int] {
+    var out = []
+    int i = from
+    while i <= endIdx {
+        out.add(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 去掉首尾的引号
+export func strip_quotes(string s): string {
+    var v = s
+    while v.byte_len() > 0 {
+        int b = v.byte(0)
+        if b == 34 or b == 39 { v = v.byte_slice(1, v.byte_len() - 1) } else { break }
+    }
+    while v.byte_len() > 0 {
+        int last = v.byte_len() - 1
+        int b = v.byte(last)
+        if b == 34 or b == 39 { v = v.byte_slice(0, last - 1) } else { break }
+    }
+    return v
+}
+
+// 域名匹配：空域名 ⇒ 匹配任意主机；前导点 ⇒ 后缀匹配
+export func domain_match(string hostname, string domain): bool {
+    if domain == "" { return true }
+    var d = domain
+    if strings.starts_with(d, ".") { d = d.byte_slice(1, d.byte_len() - 1) }
+    if hostname == d { return true }
+    return strings.ends_with(hostname, "." + d)
+}
+
+// cookie 值含这些字符 ⇒ 需要整体加双引号
+export func needs_quote(string v): bool {
+    if strings.has(v, ":") { return true }
+    if strings.has(v, "|") { return true }
+    if strings.has(v, ";") { return true }
+    if strings.has(v, "=") { return true }
+    if strings.has(v, " ") { return true }
+    if strings.has(v, "\t") { return true }
+    return false
+}
+
+// ==================== 读登录态 + 解密 cookies ====================
+// 失败一律 throw 原因码（NO_AUTH / NO_KEY / BAD_KEY / BAD_AUTH / NO_PROFILE /
+// NO_COOKIES / BAD_PAYLOAD / DECRYPT_FAILED / BAD_COOKIES），由调用方转人话
+export func load_session(): DuSession {
+    var dir = app_dir()
+    var authPath = dirs.join(dir, "auth.json")
+    var keyPath = dirs.join(dir, ".cookie-key")
+    if not files.exists(authPath) { throw "NO_AUTH" }
+    if not files.exists(keyPath) { throw "NO_KEY" }
+
+    // 密钥：32 字节原始随机数。必须二进制打开 —— files.read 是文本语义、会剥 UTF-8 BOM
+    var keyText = files.open(keyPath, "rb").read()
+    Array[int] key = strings.to_bytes(keyText)
+    if key.len() != 32 { throw "BAD_KEY" }
+
+    var text = files.read(authPath)
+    var auth = jsons.decode(text) as Dict[string, any]
+    if auth == null { throw "BAD_AUTH" }
+
+    // 选账号：profileId == activeProfileId；找不到 ⇒ 第一个
+    var activeId = jsons.get_str(auth, "activeProfileId", "")
+    var profiles = auth.get("accountProfiles")
+    var chosen = null
+    if profiles is Array[any] => arr {
+        var found = false
+        int i = 0
+        while i < arr.len() and not found {
+            var d = arr[i] as Dict[string, any]
+            if d != null and jsons.get_str(d, "profileId", "") == activeId {
+                chosen = d
+                found = true
+            }
+            i = i + 1
+        }
+        if chosen == null and arr.len() > 0 { chosen = arr[0] as Dict[string, any] }
+    }
+    if chosen == null { throw "NO_PROFILE" }
+    var enc = jsons.get_str(chosen, "encryptedCookies", "")
+    if enc == "" { throw "NO_COOKIES" }
+    var displayName = jsons.get_str(chosen, "displayName", "")
+
+    // AES-256-GCM 解密：base64 → iv(12) + tag(16) + ct；标签不符 ⇒ 抛错（AEAD 不认证不交付）
+    Array[int] payload = strings.to_bytes(strings.from_base64(enc))
+    if payload.len() < 29 { throw "BAD_PAYLOAD" }
+    Array[int] iv = sub(payload, 0, 11)
+    Array[int] tag = sub(payload, 12, 27)
+    Array[int] ct = sub(payload, 28, payload.len() - 1)
+    Array[int] plain = []
+    try {
+        plain = crypto.gcm_open_parts(key, iv, [], ct, tag)
+    } catch e {
+        throw "DECRYPT_FAILED"
+    }
+
+    var cookieJson = strings.from_bytes(plain)
+    var cookies = jsons.decode(cookieJson) as Array[any]
+    if cookies == null { throw "BAD_COOKIES" }
+
+    var s = new DuSession()
+    s.cookies = cookies
+    s.cookieHeader = build_cookie_header(cookies)
+    s.csrf = extract_csrf(cookies)
+    s.displayName = displayName
+    return s
+}
+
+// 按 TARGET_HOST 匹配 cookies，拼 Cookie 请求头
+func build_cookie_header(Array[any] cookies): string {
+    var parts = []
+    for cookies to c {
+        var d = c as Dict[string, any]
+        if d == null { continue }
+        if not domain_match(TARGET_HOST, jsons.get_str(d, "domain", "")) { continue }
+        var name = jsons.get_str(d, "name", "")
+        var v = strip_quotes(jsons.get_str(d, "value", ""))
+        if needs_quote(v) { v = "\"" + v + "\"" }
+        parts.add(name + "=" + v)
+    }
+    var out = ""
+    int i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + "; " }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// csrftoken = bce-user-info cookie 的值（按域名匹配）
+func extract_csrf(Array[any] cookies): string {
+    for cookies to c {
+        var d = c as Dict[string, any]
+        if d == null { continue }
+        if jsons.get_str(d, "name", "") == "bce-user-info"
+           and domain_match(TARGET_HOST, jsons.get_str(d, "domain", "")) {
+            return strip_quotes(jsons.get_str(d, "value", ""))
+        }
+    }
+    return ""
+}
+
+// ==================== HTTP ====================
+func new_client(): HttpClient {
+    net.globalInit()
+    HttpClient c = net.createClient()
+    c.setTimeout(REQUEST_TIMEOUT * 1000)
+    return c
+}
+
+func to_resp(Response r): ApiResp {
+    if r.statusCode == 0 {
+        return new ApiResp(code = -1, body = {"error": r.error})
+    }
+    var parsed = null
+    try { parsed = jsons.decode(r.body) } catch e { parsed = null }
+    var d = parsed as Dict[string, any]
+    if d == null {
+        return new ApiResp(code = r.statusCode, body = {"raw": clip(r.body, 500)})
+    }
+    return new ApiResp(code = r.statusCode, body = d)
+}
+
+// 接口地址做成**函数**（而不是常量）：DUMATE_API_BASE 可指向本地 stub 服务，
+// 在不碰真接口、不真的领取明天的奖励的前提下，离线端到端验证"未签到 → 领取 → 二次确认"链路 ✓
+export func api_base(): string {
+    return _env_or("DUMATE_API_BASE", API_BASE)
+}
+
+// 一次 API 调用（GET 或 POST；body 为空串 ⇒ GET，POST 用 "{}"）
+func api_call(DuSession s, string path, string method, string body): ApiResp {
+    var url = api_base() + path
+    HttpClient c = new_client()
+    // 头必须一次设完（replaceHeaders 是整表替换语义）
+    var headers = [
+        "Content-Type: application/json",
+        "X-Requested-With: XMLHttpRequest",
+        "Origin: " + API_BASE,
+        "Referer: " + API_BASE + "/",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ]
+    if s.cookieHeader != "" { headers.add("Cookie: " + s.cookieHeader) }
+    if s.csrf != "" { headers.add("csrftoken: " + s.csrf) }
+    c.replaceHeaders(headers)
+    ApiResp resp = null
+    if method == "POST" {
+        var payload = body
+        if payload == "" { payload = "{}" }
+        resp = to_resp(c.post(url, payload))
+    } else {
+        resp = to_resp(c.get(url))
+    }
+    c.close()
+    return resp
+}
+
+export func api_get(DuSession s, string path): ApiResp {
+    return api_call(s, path, "GET", "")
+}
+
+export func api_post(DuSession s, string path): ApiResp {
+    return api_call(s, path, "POST", "{}")
+}
+
+// 取前 n 个字符（仅诊断输出截断用）
+func clip(string s, int n): string {
+    if s.len() <= n { return s }
+    return s.slice(0, n - 1)
+}
+
+// ==================== 签到主流程 ====================
+// 今天是否已在 signInDays 里（日期串以今天开头的即算
+export func listed_today(Dict[string, any] resp, string today): bool {
+    var result = jsons.get_obj(resp, "result")
+    var days = jsons.get_obj(result, "signInDays")
+    if days is Array[any] => arr {
+        for arr to d {
+            if strings.starts_with(_str(d), today) { return true }
+        }
+    }
+    return false
+}
+
+// 响应 result 里的累计积分（取不到 / 为 0 ⇒ ""）
+// ⚠ 0 要按"无累计"处理：未签到时接口给 totalPoints=0
+export func total_points(Dict[string, any] resp): string {
+    var result = jsons.get_obj(resp, "result")
+    var v = jsons.get_obj(result, "totalPoints")
+    if v == null { return "" }
+    if v is int => iv {
+        if iv == 0 { return "" }
+    }
+    if v is float => fv {
+        if fv == 0.0 { return "" }
+    }
+    return jsons.get_str(result, "totalPoints", "")
+}
+
+func result_dict(string status, bool success, string message, int credits): Dict[string, any] {
+    return {"platform": PLATFORM_NAME, "success": success, "status": status,
+            "message": message, "credits": credits}
+}
+
+// 签到（dry = 只读模式：只查状态，不领取）。返回结果字典
+export func checkin(bool dry): Dict[string, any] {
+    var s = load_session()
+    var today = today_str()
+
+    // 1) 查每日登录奖励信息（只读）
+    var info = api_get(s, INFO_PATH)
+    if info.code == -1 {
+        return result_dict("failed", false, "网络不可达：" + jsons.get_str(info.body, "error", ""), 0)
+    }
+    var points = total_points(info.body)
+    if listed_today(info.body, today) {
+        var msg = "今日已签到"
+        if points != "" { msg = msg + "（累计 " + points + " 积分）" }
+        return result_dict("already", true, msg, 0)
+    }
+    if dry {
+        var msg2 = "只读模式：今日尚未签到，可正常执行"
+        if points != "" { msg2 = msg2 + "（当前累计 " + points + " 积分）" }
+        return result_dict("skipped", true, msg2, 0)
+    }
+
+    // 2) 领取每日登录奖励（幂等）
+    var cl = api_post(s, BONUS_PATH)
+    var clMsg = jsons.get_str(cl.body, "message", "")
+
+    // 3) 再查一次确认
+    var info2 = api_get(s, INFO_PATH)
+    if listed_today(info2.body, today) {
+        var tp2 = total_points(info2.body)
+        var msg3 = "签到成功"
+        if tp2 != "" { msg3 = msg3 + "（累计 " + tp2 + " 积分）" }
+        return result_dict("success", true, msg3, DAILY_CREDITS)
+    }
+    var msg4 = "签到未成功"
+    if clMsg != "" { msg4 = msg4 + "：" + clMsg }
+    return result_dict("failed", false, msg4, 0)
+}
+
+// ==================== 登录态健康检查 ====================
+// 取关键登录 cookie（BDUSS / bce-user-info / STOKEN）的最早过期时间
+export func health(): Dict[string, any] {
+    var s = load_session()
+    float earliest = 0.0
+    var has = false
+    for s.cookies to c {
+        var d = c as Dict[string, any]
+        if d == null { continue }
+        var nm = jsons.get_str(d, "name", "")
+        if nm == "BDUSS" or nm == "bce-user-info" or nm == "STOKEN" {
+            var exp = jsons.get_float(d, "expirationDate", 0.0)
+            if exp > 0.0 and (not has or exp < earliest) {
+                earliest = exp
+                has = true
+            }
+        }
+    }
+    var out = {"platform": PLATFORM_NAME, "days_left": -1}
+    if not has {
+        out.set("status", "unknown")
+        out.set("message", "未能获取登录态有效期信息")
+        return out
+    }
+    var now = _float(times.now())
+    int days = _int((earliest - now) / 86400.0)
+    if days < 0 { days = 0 }
+    out.set("days_left", days)
+    if earliest <= now {
+        out.set("status", "expired")
+        out.set("message", "cookies 已过期，请打开百度搭子客户端重新登录")
+        return out
+    }
+    if days < 7 {
+        out.set("status", "warn")
+        out.set("message", "登录态剩余 " + _str(days) + " 天，请打开百度搭子重新登录刷新")
+        return out
+    }
+    out.set("status", "ok")
+    out.set("message", "登录态剩余 " + _str(days) + " 天")
+    return out
+}
+
+// ==================== 积分余额与到期 ====================
+// "永久有效"哨兵：expireDate 可能给到 253370764800（约公元 9998 年，实际是"永不过期"）。
+//   实测本机 times.format 对 253370764800 返回空串 ⇒ 这里统一按"格式化不出来 = 永久"处理：
+//   不扔异常、不编造假日期，如实展示成"永久" ✓
+export func days_left_of(float exp): int {
+    if date_of(exp) == "永久" { return 999999 }
+    var d = _int((exp - _float(times.now())) / 86400.0)
+    if d < 0 { d = 0 }
+    return d
+}
+
+export func date_of(float ts): string {
+    var s = ""
+    try { s = times.format(_int(ts), "%Y-%m-%d") } catch e { s = "" }
+    if s == "" { return "永久" }
+    return s
+}
+
+// 积分展示：整数不带 .0
+export func fmt_credit(float f): string {
+    if f == _float(_int(f)) { return _str(_int(f)) }
+    return _str(f)
+}
+
+// incremental 的来源 → 中文标签
+export func source_label(string src): string {
+    if src == "login_bonus" { return "每日登录" }
+    if src == "grant_point" { return "奖励积分" }
+    if src == "event_bonus" { return "活动奖励" }
+    return "积分"
+}
+
+// 按 days_left 升序（插入排序；列表很短，不值得引复杂算法）
+export func sort_by_days(Array[Dict[string, any]] items): Array[Dict[string, any]] {
+    var out = []
+    for items to it { out.add(it) }
+    int n = out.len()
+    int i = 1
+    while i < n {
+        var cur = out[i]
+        int j = i - 1
+        while j >= 0 and jsons.get_int(out[j], "days_left", 0) > jsons.get_int(cur, "days_left", 0) {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = cur
+        i = i + 1
+    }
+    return out
+}
+
+// 查询 DuMate 积分套餐与到期时间（quota_overview）
+export func credits(): Array[Dict[string, any]] {
+    var s = load_session()
+    var url = QUOTA_PATH + "?timezone=Asia/Shanghai&clientType=desktop&ignoreLoginBonus=true"
+    var r = api_get(s, url)
+    var result = jsons.get_obj(r.body, "result")
+    var items = []
+
+    // 订阅套餐
+    var subs = jsons.get_obj(result, "subscription")
+    if subs is Array[any] => arr {
+        for arr to x {
+            var d = x as Dict[string, any]
+            if d == null { continue }
+            var exp = jsons.get_float(d, "expireDate", 0.0)
+            if exp <= 0.0 { continue }
+            var label = "订阅套餐"
+            if jsons.get_str(d, "packageType", "") == "plan_experience" { label = "体验套餐" }
+            items.add({"label": label,
+                       "credits": fmt_credit(jsons.get_float(d, "totalPoints", 0.0)),
+                       "expires_at": date_of(exp),
+                       "days_left": days_left_of(exp)})
+        }
+    }
+    // 增量积分
+    var incs = jsons.get_obj(result, "incremental")
+    if incs is Array[any] => arr2 {
+        for arr2 to x2 {
+            var d2 = x2 as Dict[string, any]
+            if d2 == null { continue }
+            var exp2 = jsons.get_float(d2, "expireDate", 0.0)
+            if exp2 <= 0.0 { continue }
+            items.add({"label": source_label(jsons.get_str(d2, "source", "")),
+                       "credits": fmt_credit(jsons.get_float(d2, "totalPoints", 0.0)),
+                       "expires_at": date_of(exp2),
+                       "days_left": days_left_of(exp2)})
+        }
+    }
+    return sort_by_days(items)
+}
+
+// ==================== 诊断（不打印 token/cookie 值）====================
+export func diag(): Dict[string, any] {
+    var s = load_session()
+    return {"platform": PLATFORM_NAME,
+            "app_dir": app_dir(),
+            "account": s.displayName,
+            "cookie_count": s.cookies.len(),
+            "cookie_header_len": s.cookieHeader.len(),
+            "csrf_len": s.csrf.len()}
+}
+
+// ==================== 日期 ====================
+export func today_str(): string {
+    return times.format(times.now(), "%Y-%m-%d")
+}
+
+// ==================== 失败原因码 → 人话 ====================
+export func reason_text(string code): string {
+    if code == "NO_AUTH" { return "未找到 DuMate 数据目录，请先打开百度搭子客户端登录一次" }
+    if code == "NO_KEY" { return "未找到 .cookie-key，请重新登录百度搭子" }
+    if code == "BAD_KEY" { return ".cookie-key 长度异常（不是 32 字节），请重新登录百度搭子" }
+    if code == "BAD_AUTH" { return "auth.json 解析失败，请重新登录百度搭子" }
+    if code == "NO_PROFILE" { return "未找到已登录账号，请打开百度搭子登录" }
+    if code == "NO_COOKIES" { return "未找到加密 cookies，请重新登录百度搭子" }
+    if code == "BAD_PAYLOAD" { return "加密 cookies 数据异常，请重新登录百度搭子" }
+    if code == "DECRYPT_FAILED" { return "cookies 解密失败（认证标签不匹配），请重新登录百度搭子" }
+    if code == "BAD_COOKIES" { return "解密出的 cookies 格式异常，请重新登录百度搭子" }
+    return "未知错误：" + code
+}

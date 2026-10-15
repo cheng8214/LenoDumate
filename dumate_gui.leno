@@ -1,0 +1,584 @@
+// dumate_gui.leno — 百度搭子 DuMate 每日签到（窗口版）
+//
+// 界面只做：看今日状态 / 手动签到 / 查状态 / 查登录态 / 看积分明细 / 设定时签到 + 开机自启。
+// 所有业务逻辑都在 dumate_core.leno —— 这里只画界面、接点击 ✓（与 LenoWorkBuddy 的 wb_gui 同一套写法）
+// 网络请求一律丢后台线程跑（见下方「后台网络任务」）⇒ 界面永不被 HTTP 阻塞 ✓
+//
+// 用法：
+//   leno dumate_gui.leno                 正常开窗
+//   DUMATE_GUI_AUTO=120                 跑 120 帧后打印摘要并退出（无头冒烟；配 SDL_VIDEODRIVER=dummy）
+//   DUMATE_GUI_SELFTEST=1               离线逐项自检后退出（不联网、不写真实配置）
+//   DUMATE_GUI_NO_NET=1                 不联网（界面照常，但动作只报"离线"）
+import jsons
+import strings
+import files
+import dirs
+import times
+import threads
+import SDL3
+import Sys
+import "dumate_core.leno" as core
+import "dumate_tray.leno" as tray
+use SDL3.(Event, Renderer, Scancode, Label, Window, Button, Toggle, Edit, Badge, Table)
+
+// ==================== 配置（持久化到脚本同目录）====================
+struct GuiCfg {
+    bool signin_on = false
+    string signin_at = "09:00"
+    bool autostart = false
+    string last_signed = ""      // 今天是否已自动签过（按日期去重，避免一天签多次）
+}
+
+GuiCfg CFG = new GuiCfg()
+var STATUS_TEXT = "就绪"
+var TODAY_STATUS = "未知"        // 未知 / 未签到 / 已签到 / 失败 / 查询失败
+var TODAY_TEXT = "今日：未知"
+var HEALTH_TEXT = "登录态：未检查"
+var HINT_TEXT = ""
+var BADGE_TEXT = "未知"
+var AUTO_FRAMES = 0
+var AUTO_SELFTEST = false
+var NO_NET = false
+var FRAMES = 0
+// 视图缓存（只重画变化过的 Label —— 每帧重建纹理是这个库的已知开销）
+var _c_today = ""
+var _c_health = ""
+var _c_credits = ""
+var _c_status = ""
+var _c_badge = ""
+var _c_hint = ""
+var _sfFail = 0
+var _sfPass = 0
+
+// ==================== 配置读写 ====================
+func cfg_path(): string {
+    // ⚠ 自检（DUMATE_GUI_SELFTEST=1）走**独立配置文件**：原先自检直接写真实配置，
+    //   每次跑自检都会把用户的「定时签到 / 开机自启」覆盖成自检用的测试值 ✗（README 承诺"不写真实配置"）
+    var name = "dumate_gui_cfg.json"
+    if _env("DUMATE_GUI_SELFTEST") != null { name = "dumate_gui_cfg.selftest.json" }
+    return dirs.join(dirs.script_dir(), name)
+}
+func load_cfg(): GuiCfg {
+    var c = new GuiCfg()
+    var p = cfg_path()
+    if files.exists(p) {
+        try {
+            var d = jsons.decode(files.read(p)) as Dict[string, any]
+            if d != null {
+                c.signin_on = jsons.get_bool(d, "signin_on", false)
+                c.signin_at = jsons.get_str(d, "signin_at", "09:00")
+                c.last_signed = jsons.get_str(d, "last_signed", "")
+                c.autostart = jsons.get_bool(d, "autostart", false)
+                // 与系统自启项同步（可能在别处改过）
+                try { c.autostart = Sys.getAutostart("LenoDumate") != "" } catch e { return c }
+            }
+        } catch e { return c }
+    }
+    return c
+}
+func save_cfg() {
+    var d = {"signin_on": CFG.signin_on, "signin_at": CFG.signin_at,
+             "last_signed": CFG.last_signed, "autostart": CFG.autostart}
+    try { files.write(cfg_path(), jsons.encode(d)) } catch e { return }
+}
+
+// ==================== 视图刷新 ====================
+func apply_view(Label todayLbl, Label healthLbl, Label statusLbl, Label hintLbl, Badge badge) {
+    if _c_today != TODAY_TEXT { todayLbl.set_text(TODAY_TEXT); _c_today = TODAY_TEXT }
+    if _c_health != HEALTH_TEXT { healthLbl.set_text(HEALTH_TEXT); _c_health = HEALTH_TEXT }
+    if _c_status != STATUS_TEXT { statusLbl.set_text(STATUS_TEXT); _c_status = STATUS_TEXT }
+    if _c_badge != BADGE_TEXT { badge.set_text(BADGE_TEXT); _c_badge = BADGE_TEXT }
+    if _c_hint != HINT_TEXT { hintLbl.set_text(HINT_TEXT); _c_hint = HINT_TEXT }
+}
+func refresh_today() {
+    TODAY_TEXT = "今日：" + TODAY_STATUS
+    BADGE_TEXT = TODAY_STATUS
+}
+func refresh_hints() {
+    if CFG.signin_on {
+        HINT_TEXT = "定时签到：每天 " + CFG.signin_at + "（程序在跑即生效，一天只签一次）"
+    } else {
+        HINT_TEXT = "定时签到：关（开启后到点自动签到）"
+    }
+}
+func note_result(string text) {
+    STATUS_TEXT = text
+}
+
+// ==================== 动作 ====================
+func set_today(string status, string badge) {
+    TODAY_STATUS = status
+    if badge != "" { BADGE_TEXT = badge }
+    refresh_today()
+}
+
+// ==================== 后台网络任务（核心修复：界面不再被 HTTP 按死）====================
+// 卡顿根因：core 的 checkin / health / credits 都是**同步 HTTP**（libcurl 阻塞），而 GUI 的
+//   事件循环（win.run）与它们同在主线程 ⇒ 开窗时那三个串行请求、点一次「立即签到」的三个
+//   请求，期间窗口完全不响应（Windows 标题栏"未响应"）—— 这就是"运行界面很卡"。
+// 修法：动作只**起线程**，网络在后台跑，结果经 Channel 回传，主线程每 150ms 排空一次
+//   ⇒ 点击立刻有反馈、窗口始终能拖能点 ✓
+// ⚠ 线程入口必须是**本文件（入口脚本）的具名全局函数**，且**不能是闭包**（闭包会被 GC ✗）
+//   —— 照 LenoMusic/musicdl_gui.leno 的既有约定 ✓
+// ⚠ 跨线程只传纯数据（Dict / Array / string / 标量）：Channel 会深克隆 ⇒ 安全 ✓
+Channel _RCH = threads.channel(16)     // 结果通道：{"kind": 动作名, "data": core 的返回}
+Array[string] _BUSY = []               // 正在跑的动作名（防重复点击起一堆线程 ✓）
+
+// 线程入口：跑一次网络动作，把结果（或错误）发回主线程
+//   ⚠ 形参必须标成 `Channel`（标 any 的话编译器不让调 send ✗）
+func net_worker(string kind, Channel ch) {
+    try {
+        if kind == "signin" { ch.send({"kind": kind, "data": core.checkin(false)}) }
+        else if kind == "status" { ch.send({"kind": kind, "data": core.checkin(true)}) }   // dry：只读、不领取
+        else if kind == "health" { ch.send({"kind": kind, "data": core.health()}) }
+        else if kind == "credits" { ch.send({"kind": kind, "data": core.credits()}) }
+    } catch e {
+        // 子线程的异常传不回主线程（只能靠 state() 看）⇒ 就地转成"错误结果"回传 ✓
+        var raw = ""
+        try { raw = _str(e.msg) } catch x { raw = _str(e) }
+        var bad = {"__error": core.reason_text(raw)}
+        try { ch.send({"kind": kind, "data": bad}) } catch x { return }
+    }
+}
+
+func _busy_has(string kind): bool {
+    for _BUSY to k { if k == kind { return true } }
+    return false
+}
+func _busy_drop(string kind) {
+    for _BUSY.len() to i {
+        if _BUSY[i] == kind { _BUSY.remove(i); return }
+    }
+}
+
+// 起一个后台动作（立即返回 ⇒ UI 不冻结）
+func start_task(string kind) {
+    if _busy_has(kind) { return }
+    _BUSY.add(kind)
+    try {
+        threads.start(net_worker, kind, _RCH)
+    } catch e {
+        _busy_drop(kind)
+        note_result("后台任务启动失败：" + _str(e))
+    }
+}
+
+// ---- 结果落地（**全部在主线程**执行 ⇒ 直接读写界面状态 ✓）----
+func err_of(any data): string {
+    var d = data as Dict[string, any]
+    if d == null { return "" }
+    return jsons.get_str(d, "__error", "")
+}
+
+func finish_signin(any data) {
+    var err = err_of(data)
+    if err != "" { set_today("失败", "失败"); note_result(err); return }
+    var d = data as Dict[string, any]
+    var status = jsons.get_str(d, "status", "")
+    var msg = jsons.get_str(d, "message", "")
+    if status == "success" { set_today("已签到", "已签到"); CFG.last_signed = core.today_str(); save_cfg() }
+    else if status == "already" { set_today("已签到", "已签到") }
+    else if status == "failed" { set_today("失败", "失败") }
+    else { set_today("查询失败", "失败") }
+    note_result(msg)
+}
+
+func finish_status(any data) {
+    var err = err_of(data)
+    if err != "" { set_today("失败", "失败"); note_result(err); return }
+    var d = data as Dict[string, any]
+    var status = jsons.get_str(d, "status", "")
+    var msg = jsons.get_str(d, "message", "")
+    if status == "already" { set_today("已签到", "已签到") }
+    else if status == "skipped" { set_today("未签到", "未签到") }
+    else if status == "failed" { set_today("失败", "失败") }
+    else { set_today("未知", "未知") }
+    note_result(msg)
+}
+
+func finish_health(any data) {
+    var err = err_of(data)
+    if err != "" { HEALTH_TEXT = "登录态：" + err; note_result(err); return }
+    var h = data as Dict[string, any]
+    var m = jsons.get_str(h, "message", "")
+    HEALTH_TEXT = "登录态：" + m
+    var st = jsons.get_str(h, "status", "")
+    // ⚠ 登录态 ok/warn 时**不再改写今日徽标**：原先那句 `set_today(TODAY_STATUS, "已签到")` 会把
+    //   「查状态」的结论覆盖成"已签到"（今天明明没签到也只显示已签到 ✗），而且三个动作现在
+    //   是并发跑的 ⇒ 谁后到谁说了算，徽标还会随机变 ✗。登录态只该影响它自己那一行 ✓
+    if st == "expired" { set_today("登录过期", "失败") }
+    note_result("登录态：" + m)
+}
+
+Table? CREDITS_TABLE = null        // 积分明细表格（main 里创建；可空，自检时可不建）
+
+// 类型 / 积分 / 到期 / 剩余天 —— 填进表格
+func finish_credits(any data) {
+    var err = err_of(data)
+    if err != "" { note_result(err); return }
+    if CREDITS_TABLE == null { note_result("积分明细控件未就绪"); return }
+    var items = data as Array[Dict[string, any]]
+    if items == null or items.len() == 0 {
+        CREDITS_TABLE.set_rows([])
+        note_result("积分明细：空（无套餐 / 查询为空）")
+        return
+    }
+    var rows = []
+    for items to it {
+        var label = jsons.get_str(it, "label", "积分")
+        var cr = jsons.get_str(it, "credits", "0")
+        var exp = jsons.get_str(it, "expires_at", "")
+        var dl = jsons.get_int(it, "days_left", 0)
+        var dlText = ""
+        if exp == "永久" { dlText = "永久" } else { dlText = _str(dl) }
+        rows.add([label, cr, exp, dlText])
+    }
+    CREDITS_TABLE.set_rows(rows)
+    note_result("积分明细：" + _str(items.len()) + " 条（按最近到期排序，可点表头排）")
+}
+
+// 主线程每拍排空结果通道（无结果时开销 ≈ 一次 try_receive ✓）
+func drain_net() {
+    while true {
+        var m = _RCH.try_receive()
+        if m == null { break }
+        var d = m as Dict[string, any]
+        if d == null { continue }
+        var kind = jsons.get_str(d, "kind", "")
+        _busy_drop(kind)
+        var data = d.get("data")
+        if kind == "signin" { finish_signin(data) }
+        else if kind == "status" { finish_status(data) }
+        else if kind == "health" { finish_health(data) }
+        else if kind == "credits" { finish_credits(data) }
+    }
+}
+
+// ==================== 动作（只"起任务"，绝不阻塞 UI ✓）====================
+func do_signin() {
+    if NO_NET { note_result("离线模式：已跳过签到（DUMATE_GUI_NO_NET=1）"); return }
+    STATUS_TEXT = "签到中…"
+    start_task("signin")
+}
+
+func do_status() {
+    if NO_NET { note_result("离线模式：未查询接口"); set_today("未知", "未知"); return }
+    STATUS_TEXT = "查询中…"
+    start_task("status")
+}
+
+func do_health() {
+    if NO_NET { note_result("离线模式：未检查登录态"); return }
+    STATUS_TEXT = "检查登录态…"
+    start_task("health")
+}
+
+func do_credits() {
+    if NO_NET { note_result("离线模式：未查询积分"); return }
+    STATUS_TEXT = "查询积分…"
+    start_task("credits")
+}
+
+// ==================== 自动化每拍 ====================
+func parse_hhmm(string s): int {
+    var v = s.trim()
+    var parts = v.split(":")
+    if parts.len() != 2 { return -1 }
+    var h = parts[0]
+    var m = parts[1]
+    // 小时 1~2 位、分钟**必须 2 位**（正则 ^\d{1,2}:\d{2}$）⇒ "9:0" 被拒
+    if h.byte_len() < 1 or h.byte_len() > 2 { return -1 }
+    if m.byte_len() != 2 { return -1 }
+    if not all_digits(h) or not all_digits(m) { return -1 }
+    var hh = _int(h)
+    var mm = _int(m)
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59 { return -1 }
+    return hh * 60 + mm
+}
+func all_digits(string s): bool {
+    int i = 0
+    while i < s.byte_len() {
+        int b = s.byte(i)
+        if b < 48 or b > 57 { return false }
+        i = i + 1
+    }
+    return true
+}
+func now_hhmm(): int {
+    var t = times.format(times.now(), "%H:%M")
+    return parse_hhmm(t)
+}
+func sched_tick() {
+    if AUTO_SELFTEST { return }
+    if not CFG.signin_on { return }
+    if CFG.last_signed == core.today_str() { return }      // 今天已签过
+    var set_min = parse_hhmm(CFG.signin_at)
+    if set_min < 0 { return }
+    if now_hhmm() >= set_min {
+        do_signin()
+        refresh_hints()
+    }
+}
+
+// ==================== 无头自检（离线：验配置与时间解析）====================
+func sf_ck(bool cond, string what) {
+    if cond { _sfPass = _sfPass + 1; print("[自检] OK   " + what + "\n") }
+    else { _sfFail = _sfFail + 1; print("[自检] FAIL " + what + "\n") }
+}
+func sf_run() {
+    print("[自检] 开始（离线）\n")
+    sf_ck(parse_hhmm("00:00") == 0, "时间解析 00:00")
+    sf_ck(parse_hhmm("09:00") == 540, "时间解析 09:00")
+    sf_ck(parse_hhmm("23:59") == 1439, "时间解析 23:59")
+    sf_ck(parse_hhmm("24:00") < 0, "非法 24:00 被拒")
+    sf_ck(parse_hhmm("9:0") < 0, "非法 9:0 被拒")
+    sf_ck(parse_hhmm("abc") < 0, "非法 abc 被拒")
+
+    // 配置读写往返
+    CFG.signin_on = true
+    CFG.signin_at = "08:30"
+    CFG.last_signed = "2026-10-14"
+    CFG.autostart = true
+    save_cfg()
+    var back = load_cfg()
+    sf_ck(back.signin_on, "配置往返 signin_on")
+    sf_ck(back.signin_at == "08:30", "配置往返 signin_at")
+    sf_ck(back.last_signed == "2026-10-14", "配置往返 last_signed")
+
+    // 离线时动作给出离线提示，不崩
+    NO_NET = true
+    do_signin()
+    sf_ck(STATUS_TEXT.has("离线"), "离线签到给出离线提示")
+    do_status()
+    sf_ck(STATUS_TEXT.has("离线"), "离线查状态给出离线提示")
+    do_health()
+    sf_ck(HEALTH_TEXT == "登录态：未检查", "离线查登录态不出错")
+    do_credits()
+    sf_ck(STATUS_TEXT.has("离线"), "离线查积分给出离线提示")
+    NO_NET = false
+
+    // 自动化：设 00:00 且今天未签 ⇒ 本拍应触发（但离线，do_signin 只置离线提示）
+    CFG.signin_on = true
+    CFG.signin_at = "00:00"
+    CFG.last_signed = ""
+    sched_tick()
+    sf_ck(STATUS_TEXT.has("离线"), "定时到点触发签到（离线仅提示）")
+    CFG.last_signed = core.today_str()
+    var before = STATUS_TEXT
+    sched_tick()
+    sf_ck(STATUS_TEXT == before, "今天已签 ⇒ 不再触发")
+
+    print("[自检] 通过 " + _str(_sfPass) + " / 失败 " + _str(_sfFail) + "\n")
+    _exit(if _sfFail > 0 then 1 else 0)
+}
+
+// ==================== 入口 ====================
+main() {
+    var af = _env_or("DUMATE_GUI_AUTO", "")
+    if af != "" { AUTO_FRAMES = _int(af) }
+    AUTO_SELFTEST = _env("DUMATE_GUI_SELFTEST") != null
+    NO_NET = _env("DUMATE_GUI_NO_NET") != null
+
+    // --tray：开机自启会带这个参数 ⇒ 启动即只留托盘（不打扰用户 ✓）
+    bool startHidden = false
+    for _args() to a {
+        if _str(a) == "--tray" { startHidden = true }
+    }
+
+    if AUTO_FRAMES == 0 and not AUTO_SELFTEST { _console(false) }
+
+    CFG = load_cfg()
+    refresh_today()
+    refresh_hints()
+
+    var win = SDL3.createWindow({title:"百度搭子 DuMate 签到", w:680, h:740, resizable:false})
+    if not win.ok {
+        print("[gui] 窗口创建失败\n")
+        _exit(1)
+    }
+    SDL3.ttfInit()
+
+    // 托盘（仅真实窗口模式初始化；无头自检/冒烟不要托盘 ⇒ 避免无谓报错 ✓）
+    bool trayOk = false
+    if AUTO_FRAMES == 0 and not AUTO_SELFTEST {
+        trayOk = tray.tray_init(win,
+            func():void { do_signin(); refresh_hints() },
+            func():void { do_status(); refresh_hints() })
+        if trayOk and startHidden {
+            tray.tray_show(false)
+            print("[gui] --tray：启动即隐藏到托盘\n")
+        }
+    }
+
+    // ---- 顶部：标题 + 状态徽标 ----
+    win.add(SDL3.createLabel({x:24, y:14, text:"百度搭子 DuMate 签到", font_size:22, text_color:#DCE6FFFF}))
+    var badge = SDL3.createBadge({x:560, y:16, text:BADGE_TEXT, font_size:13.0, bg_color:#2A3242FF,
+                                  text_color:#C8D2E6FF, border_color:#505564FF})
+    win.add(badge)
+
+    // ---- 卡片 A：今日 ----
+    var cardA = win.addPanel({x:24, y:56, w:632, h:84, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    var todayLbl = SDL3.createLabel({x:44, y:74, text:TODAY_TEXT, font_size:18, text_color:#DCE6FFFF})
+    cardA.add(todayLbl)
+
+    // ---- 卡片 B：操作 ----
+    var cardB = win.addPanel({x:24, y:152, w:632, h:80, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    var btnSignin = SDL3.createButton({x:44, y:174, w:150, h:44, text:"立即签到", type:"primary",
+                                       font_size:15, tip:"领取每日登录奖励（幂等，重复点只是多查一次）"})
+    cardB.add(btnSignin)
+    var btnStatus = SDL3.createButton({x:206, y:174, w:130, h:44, text:"查状态", font_size:15,
+                                       tip:"只读查询今日是否已签到（不领取）"})
+    cardB.add(btnStatus)
+    var btnHealth = SDL3.createButton({x:348, y:174, w:130, h:44, text:"登录态", font_size:15,
+                                       tip:"检查本机登录态剩余有效天数"})
+    cardB.add(btnHealth)
+    var btnCredits = SDL3.createButton({x:490, y:174, w:150, h:44, text:"积分明细", font_size:15,
+                                       tip:"查 DuMate 积分套餐与到期时间（按最近到期排序）"})
+    cardB.add(btnCredits)
+
+    // ---- 卡片 C：登录态 ----
+    var cardC = win.addPanel({x:24, y:244, w:632, h:64, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    cardC.add(SDL3.createLabel({x:44, y:260, text:"登录态", font_size:15, text_color:#B4C8FFFF}))
+    var healthLbl = SDL3.createLabel({x:108, y:260, text:HEALTH_TEXT, font_size:14, text_color:#DCE6FFFF})
+    cardC.add(healthLbl)
+
+    // ---- 卡片 D：积分明细（表格控件）----
+    var cardD = win.addPanel({x:24, y:320, w:632, h:236, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    cardD.add(SDL3.createLabel({x:44, y:336, text:"积分明细（点表头可排序）", font_size:15, text_color:#B4C8FFFF}))
+    CREDITS_TABLE = win.addTable({
+        x:44, y:364, w:592, h:182,
+        headers:["类型", "积分", "到期", "剩余天"],
+        col_widths:[180, 90, 178, 144],
+        aligns:[0, 2, 0, 2],          // 0 左 1 中 2 右
+        numeric_cols:[1],             // 积分按数值排序（剩余天里可能含"永久"串，不进数值列）
+        sortable:true, zebra:true,
+        font_size:13, item_h:26, header_h:28,
+        empty_text:"（点「积分明细」查看；或离线/无套餐时为空）"
+    })
+
+    // ---- 卡片 E：自动化 ----
+    var cardE = win.addPanel({x:24, y:568, w:632, h:96, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    cardE.add(SDL3.createLabel({x:44, y:584, text:"自动化", font_size:15, text_color:#B4C8FFFF}))
+
+    var tglSignin = SDL3.createToggle({x:44, y:614, w:52, h:28, on:CFG.signin_on,
+                                       tip:"每天到点自动签到（程序在跑即生效，一天只签一次）"})
+    cardE.add(tglSignin)
+    cardE.add(SDL3.createLabel({x:108, y:619, text:"定时签到", font_size:15, text_color:#DCE6FFFF}))
+    var edtTime = SDL3.createEdit({x:196, y:614, w:76, h:30, text:CFG.signin_at, font_size:15, tip:"每天几点（HH:MM，本地时间）"})
+    cardE.add(edtTime)
+
+    var tglAuto = SDL3.createToggle({x:300, y:614, w:52, h:28, on:CFG.autostart, tip:"开机自动启动本程序"})
+    cardE.add(tglAuto)
+    cardE.add(SDL3.createLabel({x:364, y:619, text:"开机自启动", font_size:15, text_color:#DCE6FFFF}))
+
+    // ---- 底部状态行 ----
+    var statusLbl = SDL3.createLabel({x:24, y:676, text:STATUS_TEXT, font_size:14, text_color:#B4C8FFFF})
+    win.add(statusLbl)
+    var hintLbl = SDL3.createLabel({x:24, y:704, text:HINT_TEXT, font_size:12, text_color:#7A8396FF})
+    win.add(hintLbl)
+
+    // ==================== 回调 ====================
+    btnSignin.on_click(func():void { do_signin(); refresh_hints() })
+    btnStatus.on_click(func():void { do_status(); refresh_hints() })
+    btnHealth.on_click(func():void { do_health() })
+    btnCredits.on_click(func():void { do_credits() })
+
+    tglSignin.on_change(func(bool on) {
+        CFG.signin_on = on
+        if not on { CFG.last_signed = "" }       // 关掉再开 ⇒ 允许当天再自动签一次
+        save_cfg()
+        refresh_hints()
+        note_result("定时签到已" + (if on then "开启" else "关闭"))
+    })
+    edtTime.on_change(func() {
+        var v = edtTime.get_text().trim()
+        if parse_hhmm(v) < 0 {
+            note_result("时间格式要 HH:MM（如 08:30）—— 已保留原设置 " + CFG.signin_at)
+            return
+        }
+        CFG.signin_at = v
+        save_cfg()
+        refresh_hints()
+        note_result("定时签到时间已设为 " + v)
+    })
+    tglAuto.on_change(func(bool on) {
+        // 交给托盘层统一写自启项（命令带 --tray ⇒ 开机自启启动即只留托盘 ✓）
+        var ok = false
+        try { ok = tray.set_autostart(on) } catch e { ok = false }
+        if not ok {
+            note_result("开机自启动设置失败（自启项不可写或本平台未实现）")
+            tglAuto.set_on(not on)
+        } else {
+            CFG.autostart = on
+            save_cfg()
+            note_result("开机自启动已" + (if on then "开启" else "关闭"))
+        }
+    })
+
+    // 自动化拍子：1 秒一次判定（到点才真发请求）
+    win.addTimer(1000, func():void {
+        sched_tick()
+        refresh_today()
+    })
+    // 150ms 一拍：① 排空后台网络结果（**必须无条件注册** —— 托盘不可用/无头时也得能收结果 ✗）
+    //            ② 托盘轮询（图标被点 / 菜单点外面）
+    // ⚠ 悬停提示必须「变了才写」：tray_set_tip 底下是同步 Shell_NotifyIcon（惊动 Explorer、
+    //   会阻塞主线程）⇒ 放进 render 每帧写会让界面明显发涩（鼠标一动就疯狂触发 ✗）。
+    //   照 wb_gui / trae_gui 的做法：缓存比对，只在文本真变化时写一次 ✓
+    string tipCache = ""
+    win.addTimer(150, func():void {
+        drain_net()
+        if trayOk {
+            tray.tray_tick()
+            var tip = TODAY_TEXT + " · " + STATUS_TEXT
+            if tipCache != tip {
+                tipCache = tip
+                tray.tray_set_tip(tip)
+            }
+        }
+    })
+    // 无头冒烟要强制重绘：win.run 事件驱动重绘，空闲不画 ⇒ 不放定时器帧数不前进
+    if AUTO_FRAMES > 0 { win.addTimer(50, func():void { }) }
+
+    if AUTO_SELFTEST {
+        win.addTimerOnce(400, func():void { sf_run() })
+    } else if not NO_NET {
+        // 打开即自动拉取：今日状态 + 登录态 + 积分明细（表格），不用挨个点按钮 ✓
+        do_status()
+        do_health()
+        do_credits()
+    }
+
+    // ==================== 主循环 ====================
+    win.run(
+        func(Event ev): bool {
+            if ev.isQuit() { return false }
+            if ev.isWindowClose() {
+                // 收进托盘继续跑 ⇒ 必须 cancelClose()：run() 判定销毁的条件是
+                // 「isWindowClose 且未 cancel」⇒ 只 return true 不 cancel，窗口照样被销毁，
+                // 之后托盘"显示窗口"的 show() 对已销毁窗口无效 ✗
+                if trayOk {
+                    tray.tray_show(false)
+                    win.cancelClose()
+                    return true
+                }
+                return false
+            }
+            if ev.isKeyDown() and ev.scancode() == Scancode.ESCAPE { return false }
+            return true
+        },
+        func(Renderer r) {
+            r.clearColor(#12141AFF)
+            apply_view(todayLbl, healthLbl, statusLbl, hintLbl, badge)
+            FRAMES = FRAMES + 1
+            if FRAMES == 1 { print("[gui] 首帧渲染 ok　" + TODAY_TEXT + "　" + STATUS_TEXT + "\n") }
+            if AUTO_FRAMES > 0 and FRAMES >= AUTO_FRAMES {
+                print("[gui] frames=" + _str(FRAMES) + "  " + TODAY_TEXT + "  状态=" + STATUS_TEXT + "\n")
+                _exit(if _sfFail > 0 then 1 else 0)
+            }
+        }
+    )
+    print("[gui] 主循环退出　frames=" + _str(FRAMES) + "　状态=" + STATUS_TEXT + "\n")
+    tray.tray_shutdown()
+    SDL3.ttfQuit()
+}

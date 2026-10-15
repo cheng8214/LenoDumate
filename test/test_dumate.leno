@@ -1,0 +1,300 @@
+// test/test_dumate.leno — DuMate 签到离线回归（真 HTTP、本地 stub、自制 fixture、不碰真接口）
+//
+// 为什么要它：签到"未签→领取"一天只能碰一次真接口，而"已签 / 领取被拒 / 登录过期 /
+// dry 只读 / 积分永久哨兵 / cookie 域名匹配与引号转义"这些分支平时根本撞不上 ⇒ 全部离线跑穿。
+//
+// 运行：leno test\test_dumate.leno
+import jsons
+import strings
+import files
+import dirs
+import times
+import "..\\dumate_core.leno" as core
+import "Crypto" as crypto
+
+var passed = 0
+var failed = 0
+var leno_exe = ""
+var stub_path = ""
+var cli_path = ""
+var fixture_dir = ""
+
+func ok(string name, bool got) {
+    if got {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name)
+    }
+}
+
+func eq_s(string name, string got, string want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望「" + want + "」，实际「" + got + "」")
+    }
+}
+
+func eq_i(string name, int got, int want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望 " + _str(want) + "，实际 " + _str(got))
+    }
+}
+
+func has_text(string name, string haystack, string needle) {
+    if haystack.has(needle) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：找不到「" + needle + "」\n    实际：「" + haystack + "」")
+    }
+}
+
+// ==================== ① 纯函数单测（不起服务、不读登录态）====================
+func test_units() {
+    // ---- strip_quotes ----
+    eq_s("strip_quotes 双引号", core.strip_quotes("\"abc\""), "abc")
+    eq_s("strip_quotes 单引号", core.strip_quotes("'x'"), "x")
+    eq_s("strip_quotes 混合", core.strip_quotes("\"'x'\""), "x")
+    eq_s("strip_quotes 无引号", core.strip_quotes("plain"), "plain")
+    eq_s("strip_quotes 空串", core.strip_quotes(""), "")
+
+    // ---- domain_match（console.bce.baidu.com 的匹配规则）----
+    ok("domain_match 空域名", core.domain_match("console.bce.baidu.com", ""))
+    ok("domain_match 同级", core.domain_match("console.bce.baidu.com", "console.bce.baidu.com"))
+    ok("domain_match .baidu.com", core.domain_match("console.bce.baidu.com", ".baidu.com"))
+    ok("domain_match .bce.baidu.com", core.domain_match("console.bce.baidu.com", ".bce.baidu.com"))
+    ok("domain_match 裸后缀", core.domain_match("console.bce.baidu.com", "baidu.com"))
+    ok("domain_match 不匹配 login 子域", not core.domain_match("console.bce.baidu.com", "login.bce.baidu.com"))
+    ok("domain_match 不匹配外域", not core.domain_match("console.bce.baidu.com", ".other.com"))
+
+    // ---- needs_quote（":|;= \t" 任一位即加引号）----
+    ok("needs_quote 空格", core.needs_quote("a b"))
+    ok("needs_quote 竖线", core.needs_quote("a|b"))
+    ok("needs_quote 分号", core.needs_quote("a;b"))
+    ok("needs_quote 等号", core.needs_quote("a=b"))
+    ok("needs_quote 制表符", core.needs_quote("a\tb"))
+    ok("needs_quote 普通值不加", not core.needs_quote("abcXYZ019"))
+
+    // ---- listed_today（signInDays 以今天开头的即算）----
+    var today = core.today_str()
+    var yesterday = times.format(times.now() - 86400, "%Y-%m-%d")
+    var signed = {"result": {"signInDays": [today], "totalPoints": 500}}
+    var signedOld = {"result": {"signInDays": [yesterday], "totalPoints": 500}}
+    var signedStamp = {"result": {"signInDays": [today + "T10:00:00"], "totalPoints": 500}}
+    var none = {"result": {"signInDays": [], "totalPoints": 0}}
+    var noField = {"result": {}}
+    ok("listed_today 今天在列", core.listed_today(signed, today))
+    ok("listed_today 只有昨天", not core.listed_today(signedOld, today))
+    ok("listed_today 带时间戳前缀", core.listed_today(signedStamp, today))
+    ok("listed_today 空列表", not core.listed_today(none, today))
+    ok("listed_today 缺字段", not core.listed_today(noField, today))
+    eq_s("total_points 数字转串", core.total_points(signed), "500")
+    eq_s("total_points 为 0 按无累计", core.total_points(none), "")
+    eq_s("total_points 缺失", core.total_points(noField), "")
+
+    // ---- 永久哨兵与日期 ----
+    eq_s("date_of 2099", core.date_of(4102415940.0), "2099-12-31")
+    eq_s("date_of 永久哨兵", core.date_of(253370764800.0), "永久")
+    eq_i("days_left_of 永久哨兵", core.days_left_of(253370764800.0), 999999)
+    ok("days_left_of 近期为正", core.days_left_of(_float(times.now() + 3 * 86400)) >= 2)
+    eq_i("days_left_of 已过期归零", core.days_left_of(_float(times.now() - 86400)), 0)
+
+    // ---- 积分格式 / 来源标签 / 排序 ----
+    eq_s("fmt_credit 整数不带 .0", core.fmt_credit(500.0), "500")
+    eq_s("fmt_credit 小数保留", core.fmt_credit(123.5), "123.5")
+    eq_s("source_label 每日登录", core.source_label("login_bonus"), "每日登录")
+    eq_s("source_label 奖励积分", core.source_label("grant_point"), "奖励积分")
+    eq_s("source_label 活动奖励", core.source_label("event_bonus"), "活动奖励")
+    eq_s("source_label 未知归积分", core.source_label("invite_bonus"), "积分")
+    var unsorted = []
+    unsorted.add({"label": "c", "days_left": 30})
+    unsorted.add({"label": "a", "days_left": 1})
+    unsorted.add({"label": "b", "days_left": 9})
+    var sorted = core.sort_by_days(unsorted)
+    eq_s("sort_by_days 第 1", jsons.get_str(sorted[0], "label", ""), "a")
+    eq_s("sort_by_days 第 2", jsons.get_str(sorted[1], "label", ""), "b")
+    eq_s("sort_by_days 第 3", jsons.get_str(sorted[2], "label", ""), "c")
+}
+
+// ==================== ② 自制 fixture：加密登录态 → 解密往返 ====================
+// 用同一个 Crypto 库现场造一份"qianfan-desktop-app"：32 字节密钥 + AES-256-GCM 密文
+// （布局 iv(12)+tag(16)+ct，与真实客户端一致）⇒ 解密链路回归不依赖本机是否登录 ✓
+func build_fixture(): string {
+    var dir = dirs.join(_tmpdir(), "dumate_test_" + _str(_pid()))
+    dirs.mkdir(dir)
+
+    // 32 字节密钥（确定性值；与真实 .cookie-key 同形——原始随机字节）
+    Array[int] key = []
+    for 0:31 to i { key.add(i * 7 % 256) }
+    var keyFile = files.open(dirs.join(dir, ".cookie-key"), "wb")
+    keyFile.write(strings.from_bytes(key))
+    keyFile.close()
+
+    // 4 个 cookie：两个匹配 console.bce.baidu.com、一个空域名（匹配任意主机）、
+    // 一个 login.bce.baidu.com（**不**进请求头，但进健康检查）⇒ 覆盖域名匹配的两面
+    var exp = _int(times.now()) + 300 * 86400
+    var cookies = [
+        {"name": "BDUSS", "value": "test-bduss-value", "domain": ".baidu.com", "expirationDate": exp},
+        {"name": "bce-user-info", "value": "csrf-token-xyz", "domain": ".bce.baidu.com", "expirationDate": exp},
+        {"name": "bce-ctl-client-cookies", "value": "a b|c;d=e", "domain": "", "expirationDate": 0},
+        {"name": "STOKEN", "value": "test-stoken", "domain": "login.bce.baidu.com", "expirationDate": exp}
+    ]
+    var cookieJson = jsons.encode(cookies)
+
+    // AES-256-GCM 密封 → 拆成 iv + tag + ct → base64（真实 auth.json 的 encryptedCookies 布局）
+    Array[int] iv = []
+    for 0:11 to i { iv.add(100 + i) }
+    Array[int] sealed = crypto.aes_gcm_seal(key, iv, [], strings.to_bytes(cookieJson))
+    int n = sealed.len()
+    Array[int] tag = []
+    for n - 16:n - 1 to i { tag.add(sealed[i]) }
+    Array[int] ct = []
+    for 0:n - 17 to i { ct.add(sealed[i]) }
+    var payload = []
+    for 0:11 to i { payload.add(iv[i]) }
+    for 0:15 to i { payload.add(tag[i]) }
+    for 0:ct.len() - 1 to i { payload.add(ct[i]) }
+    var b64 = strings.to_base64(strings.from_bytes(payload))
+
+    // auth.json：激活账号带 encryptedCookies；另一个账号不带（会跳过它）
+    var authJson = "{\"activeProfileId\":\"p-active\",\"accountProfiles\":["
+        + "{\"profileId\":\"p-other\",\"loginType\":\"bce\",\"displayName\":\"other-user\"},"
+        + "{\"profileId\":\"p-active\",\"loginType\":\"bce\",\"displayName\":\"testuser\","
+        + "\"encryptedCookies\":\"" + b64 + "\"}]}"
+    files.write(dirs.join(dir, "auth.json"), authJson)
+    return dir
+}
+
+func test_fixture() {
+    fixture_dir = build_fixture()
+    _env("DUMATE_APP_DIR", fixture_dir)
+    var s = core.load_session()
+    eq_i("fixture cookie 数", s.cookies.len(), 4)
+    eq_s("fixture 账号名", s.displayName, "testuser")
+    eq_s("fixture csrftoken", s.csrf, "csrf-token-xyz")
+    has_text("请求头含 BDUSS", s.cookieHeader, "BDUSS=test-bduss-value")
+    has_text("请求头含 bce-user-info", s.cookieHeader, "bce-user-info=csrf-token-xyz")
+    // 值含 :|;= 空格 ⇒ 整体加引号
+    has_text("特殊字符值加引号", s.cookieHeader, "bce-ctl-client-cookies=\"a b|c;d=e\"")
+    // login.bce.baidu.com 的 cookie 不进 console 的请求头
+    ok("请求头不含 login 子域 cookie", not s.cookieHeader.has("STOKEN"))
+    // 健康检查按名字取、不按域名 ⇒ STOKEN 计入
+    var h = core.health()
+    eq_s("health 状态", jsons.get_str(h, "status", ""), "ok")
+    ok("health 剩余天数约 300", jsons.get_int(h, "days_left", 0) >= 299)
+}
+
+// ==================== ③ stub 端到端 ====================
+func start_stub(string mode, int port): int {
+    _env("DUMATE_STUB_MODE", mode)
+    return _spawn(leno_exe, "\"" + stub_path + "\" " + _str(port))
+}
+
+func use_endpoint(int port) {
+    _env("DUMATE_API_BASE", "http://127.0.0.1:" + _str(port))
+}
+
+func test_flow() {
+    // ---- ① fresh：未签 → 领取 → 二次确认；再跑一次判已签 ----
+    var h1 = start_stub("fresh", 8811)
+    sleep(600)
+    use_endpoint(8811)
+    var r1 = core.checkin(false)
+    eq_s("① 签到成功 status", jsons.get_str(r1, "status", ""), "success")
+    eq_i("① 签到成功积分", jsons.get_int(r1, "credits", 0), 500)
+    has_text("① 文案", jsons.get_str(r1, "message", ""), "签到成功")
+    var r1b = core.checkin(false)
+    eq_s("① 第二次判已签", jsons.get_str(r1b, "status", ""), "already")
+    has_text("① 已签文案带累计", jsons.get_str(r1b, "message", ""), "今日已签到（累计 500 积分）")
+    _kill(h1)
+
+    // ---- ② already：服务端始终说已签 ----
+    var h2 = start_stub("already", 8812)
+    sleep(600)
+    use_endpoint(8812)
+    var r2 = core.checkin(false)
+    eq_s("② 已签 status", jsons.get_str(r2, "status", ""), "already")
+    eq_i("② 已签不得分", jsons.get_int(r2, "credits", 0), 0)
+    _kill(h2)
+
+    // ---- ③ claim_fail：领取被拒 + 二次确认仍没签 ----
+    var h3 = start_stub("claim_fail", 8813)
+    sleep(600)
+    use_endpoint(8813)
+    var r3 = core.checkin(false)
+    eq_s("③ 领取被拒 status", jsons.get_str(r3, "status", ""), "failed")
+    ok("③ 领取被拒 success=false", not jsons.get_bool(r3, "success", true))
+    has_text("③ 带服务端 message", jsons.get_str(r3, "message", ""), "领取失败：今日名额已满")
+    _kill(h3)
+
+    // ---- ④ no_auth：查询返回 401 业务码 ----
+    var h4 = start_stub("no_auth", 8814)
+    sleep(600)
+    use_endpoint(8814)
+    var r4 = core.checkin(false)
+    eq_s("④ 登录过期 status", jsons.get_str(r4, "status", ""), "failed")
+    _kill(h4)
+
+    // ---- ⑤ dry（status 子命令）：只读，不领取 ----
+    var h5 = start_stub("fresh", 8815)
+    sleep(600)
+    use_endpoint(8815)
+    var r5 = core.checkin(true)
+    eq_s("⑤ 只读 status", jsons.get_str(r5, "status", ""), "skipped")
+    ok("⑤ 只读 success=true", jsons.get_bool(r5, "success", false))
+    // 未签到时 totalPoints=0 ⇒ 不拼"（累计 0 积分）"后缀
+    ok("⑤ 零积分不带后缀", not jsons.get_str(r5, "message", "").has("累计"))
+    // 只读跑完再实跑一轮 ⇒ 应该能领到（证明 dry 没有偷偷提交）
+    var r5b = core.checkin(false)
+    eq_s("⑤ 只读后实跑可领", jsons.get_str(r5b, "status", ""), "success")
+    _kill(h5)
+
+    // ---- ⑥ credits：含永久哨兵与 2099 年 ----
+    var h6 = start_stub("fresh", 8816)
+    sleep(600)
+    use_endpoint(8816)
+    var items = core.credits()
+    eq_i("⑥ 积分条目数", items.len(), 4)
+    has_text("⑥ 永久哨兵展示", jsons.encode(items), "\"expires_at\":\"永久\"")
+    has_text("⑥ 2099 展示", jsons.encode(items), "\"expires_at\":\"2099-12-31\"")
+    has_text("⑥ 每日登录标签", jsons.encode(items), "\"label\":\"每日登录\"")
+    // 升序：第 1 条天数最小
+    ok("⑥ 按剩余天数升序", jsons.get_int(items[0], "days_left", 999999) <= jsons.get_int(items[3], "days_left", 999999))
+    _kill(h6)
+}
+
+// ==================== ④ CLI 端到端（子进程跑真 CLI）====================
+func test_cli() {
+    var h = start_stub("already", 8817)
+    sleep(600)
+    use_endpoint(8817)
+    // DUMATE_APP_DIR / DUMATE_API_BASE 已在本进程环境里 ⇒ 子进程继承
+    ExecResult? out = _exec("\"" + leno_exe + "\" \"" + cli_path + "\" status json", 60000)
+    ok("CLI 子进程正常退出", out != null and out.code == 0)
+    if out != null {
+        has_text("CLI json 含 already", out.output, "\"status\":\"already\"")
+        has_text("CLI json 成功标记", out.output, "\"success\":true")
+    }
+    _kill(h)
+}
+
+main() {
+    leno_exe = _executable()
+    stub_path = dirs.join(dirs.script_dir(), "dumate_stub.leno")
+    cli_path = dirs.join(dirs.join(dirs.script_dir(), ".."), "dumate_sign.leno")
+
+    test_units()
+    test_fixture()
+    test_flow()
+    test_cli()
+
+    print("")
+    print("通过 " + _str(passed) + " 项，失败 " + _str(failed) + " 项")
+    if failed > 0 { _exit(1) }
+}

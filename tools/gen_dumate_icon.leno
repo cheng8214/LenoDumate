@@ -1,0 +1,121 @@
+// gen_dumate_icon.leno — 生成 Dumate 托盘 / 应用图标（256×256 PNG）
+//
+// 纯代码画：圆形品牌底色 + 白色对勾（代表"签到 / check-in"）。
+// 不依赖任何外部图片资源；菜单图标在 dumate_tray.leno 里传 ""（无图标）即可。
+//
+// 用法：
+//   leno tools\gen_dumate_icon.leno                 → 写到 images\dumate.png
+//   leno tools\gen_dumate_icon.leno out.png         → 指定输出路径
+//
+// 之后转 .ico（打包用）：
+//   leno ..\Leno\tools\png_to_ico.leno images\dumate.png dumate.ico
+import ffi
+import files
+import dirs
+import SDL3
+
+const W = 256
+const H = 256
+const PITCH = W * 4
+
+// 品牌色（百度蓝系）：r,g,b
+const R = 45
+const G = 106
+const B = 227
+
+// 圆参数
+const CX = 128
+const CY = 128
+const RAD = 120
+
+// 对勾两段的端点（都在圆内）
+const AX = 76
+const AY = 134
+const BX = 112
+const BY = 170
+const CXc = 186
+const CYc = 82
+const THICK = 30
+const THRESH = 225          // (THICK/2)^2 = 15^2
+
+func in_circle(int px, int py): bool {
+    int dx = px - CX
+    int dy = py - CY
+    return (dx * dx + dy * dy) <= RAD * RAD
+}
+
+// 点 (px,py) 到线段 (ax,ay)-(bx,by) 的**平方距离**（固定点定点，避免浮点）
+func seg_dist2(int px, int py, int ax, int ay, int bx, int by): int {
+    int dx = bx - ax
+    int dy = by - ay
+    int len2 = dx * dx + dy * dy
+    if len2 == 0 {
+        int ex = px - ax
+        int ey = py - ay
+        return ex * ex + ey * ey
+    }
+    int num = (px - ax) * dx + (py - ay) * dy
+    int scaled = (num * 1024) / len2
+    if scaled < 0 { scaled = 0 } else if scaled > 1024 { scaled = 1024 }
+    int qx = ax + (scaled * dx) / 1024
+    int qy = ay + (scaled * dy) / 1024
+    int ex = px - qx
+    int ey = py - qy
+    return ex * ex + ey * ey
+}
+
+func on_check(int px, int py): bool {
+    if seg_dist2(px, py, AX, AY, BX, BY) <= THRESH { return true }
+    if seg_dist2(px, py, BX, BY, CXc, CYc) <= THRESH { return true }
+    return false
+}
+
+main() {
+    var args = _args()
+    string out = ""
+    if args.len() >= 1 { out = _str(args[0]) }
+    else { out = dirs.join(dirs.script_dir(), "images/dumate.png") }
+
+    if not SDL3.initVideo() {
+        print("[icon] SDL init 失败\n")
+        _exit(1)
+    }
+
+    Ptr[u8] px = ffi.malloc(W * H * 4)
+    int i = 0
+    for H to y {
+        for W to x {
+            int r, g, b, a
+            if in_circle(x, y) {
+                r = R; g = G; b = B; a = 255
+            } else {
+                r = 0; g = 0; b = 0; a = 0
+            }
+            if on_check(x, y) {
+                r = 255; g = 255; b = 255; a = 255
+            }
+            ffi.write_byte(px, i, r)
+            ffi.write_byte(px, i + 1, g)
+            ffi.write_byte(px, i + 2, b)
+            ffi.write_byte(px, i + 3, a)
+            i = i + 4
+        }
+    }
+
+    Ptr[u8] surf = SDL3.createSurfaceFromRaw(W, H, SDL3.PIXELFORMAT_RGBA8888, px, PITCH)
+    if surf == null {
+        print("[icon] 创建 surface 失败\n")
+        ffi.free(px)
+        _exit(1)
+    }
+    bool ok = SDL3.saveImagePNG(surf, out)
+    SDL3.destroySurface(surf)
+    ffi.free(px)
+    SDL3.quit()
+    if ok {
+        print("[icon] 完成：" + out + " (" + _str(W) + "x" + _str(H) + ")\n")
+    } else {
+        print("[icon] 保存失败：" + out + "\n")
+        _exit(1)
+    }
+}

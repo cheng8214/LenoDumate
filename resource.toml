@@ -1,0 +1,20 @@
+# resource.toml — LenoDumate 打包配置（独立于脚本，只控制 `leno -p`）
+#
+# [pack] 控 `leno -p`：
+#   onefile = true  → 单文件：脚本 + 原生库（SDL3 / SDL3_image / SDL3_ttf / libcurl，
+#                     由被 import 模块 LenoSDL3 / LenoWeb 的 leno.toml 声明）全部内嵌进 exe；
+#                     首次运行自动解包到用户缓存目录（按内容哈希分目录），分发只需一个 exe ✓
+#   resources      → 资源通配数组（相对本文件；GUI 不依赖外部图片/图标，留空）
+#   icon           → 可选 "app.ico"；不写则用 VM 默认图标
+#
+# 两条入口：
+#   · dumate_sign.leno  —— CLI（控制台版 VM，默认）
+#   · dumate_gui.leno    —— GUI（无控制台版 VM，打包时加 --no-console，双击不弹黑框）
+#
+# icon      —— exe / 应用图标（dumate.ico，由 tools/gen_dumate_icon.leno 生成）
+# resources —— 托盘图标 images/dumate.png（GUI 界面用；CLI 打包时一并内嵌、无害）
+
+[pack]
+onefile   = true
+icon     = "dumate.ico"
+resources = ["images/**"]

@@ -1,0 +1,16 @@
+# Leno 打包产物（leno -p 生成，分发用；重打即可重建，不入库）
+dist/
+dist-*/
+logs/
+
+# Leno 编译缓存
+.lenocache/
+*.lenb
+test/*.lenb
+
+# LSP 缓存
+.lenocache_lsp/
+
+# GUI 运行时配置（自动生成，可删；自检用独立文件）
+dumate_gui_cfg.json
+dumate_gui_cfg.selftest.json
